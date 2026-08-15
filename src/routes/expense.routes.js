@@ -18,13 +18,11 @@ const expenseSchema = z.object({
   spentOn: dateString.optional(),
   note: z.string().trim().max(500).optional(),
 
-  /** Who fronted the cash. Defaults to the person logging it. */
-  paidBy: z.string().uuid().optional(),
   /**
-   * TRUE when the money came out of the shared cash rather than the payer's
-   * own pocket. Defaults to true for the account holder, false for anyone else.
+   * Who handed over the cash. Recorded for the receipt only — it never moves
+   * anyone's balance, because the money left the shared wallet either way.
    */
-  fromPot: z.boolean().optional(),
+  paidBy: z.string().uuid().optional(),
 
   splitMode: z.enum(['SINGLE', 'EQUAL', 'CUSTOM']).default('SINGLE'),
   /** SINGLE */
@@ -68,11 +66,7 @@ router.post('/', asyncHandler(async (req, res) => {
 
   const paidBy = body.paidBy || req.space.memberId;
   if (!validIds.has(paidBy)) throw ApiError.badRequest('The payer is not in this space');
-
-  // The account holder pays out of the shared cash; anyone else is using their
-  // own money and gets credited back for it.
   const payer = members.find((m) => m.id === paidBy);
-  const fromPot = body.fromPot ?? payer.role === 'OWNER';
 
   const shares = resolveShares({
     mode: body.splitMode,
@@ -87,12 +81,12 @@ router.post('/', asyncHandler(async (req, res) => {
       `INSERT INTO expenses
          (space_id, member_id, item, category_key, amount, spent_on, note, created_by,
           paid_by, from_pot, split_mode)
-       VALUES ($1, $2, $3, $4, $5, COALESCE($6::date, CURRENT_DATE), $7, $8, $9, $10, $11)
+       VALUES ($1, $2, $3, $4, $5, COALESCE($6::date, CURRENT_DATE), $7, $8, $9, TRUE, $10)
        RETURNING id`,
       [req.space.id,
        shares.length === 1 ? shares[0].id : null, // legacy single-consumer column
        body.item, body.categoryKey, body.amount, body.spentOn || null, body.note || null,
-       req.user.id, paidBy, fromPot, body.splitMode]
+       req.user.id, paidBy, body.splitMode]
     );
     for (const share of shares) {
       await client.query(
@@ -113,7 +107,6 @@ router.post('/', asyncHandler(async (req, res) => {
     id: expenseId,
     paidBy,
     paidByName: payer.name,
-    fromPot,
     splitMode: body.splitMode,
     shares: shares.map((s) => ({
       memberId: s.id,
@@ -199,7 +192,6 @@ router.get('/', asyncHandler(async (req, res) => {
       spentOn: r.spent_on,
       note: r.note,
       splitMode: r.split_mode,
-      fromPot: r.from_pot,
       paidBy: r.paid_by,
       paidByName: r.paid_by_name,
       paidByColor: r.paid_by_color,
@@ -239,7 +231,6 @@ router.get('/:expenseId', asyncHandler(async (req, res) => {
     spentOn: e.spent_on,
     note: e.note,
     splitMode: e.split_mode,
-    fromPot: e.from_pot,
     paidBy: e.paid_by,
     paidByName: e.paid_by_name,
     shares: shares.map((s) => ({
@@ -263,8 +254,6 @@ router.patch('/:expenseId', asyncHandler(async (req, res) => {
 
   const paidBy = body.paidBy || existing.paid_by;
   if (paidBy && !validIds.has(paidBy)) throw ApiError.badRequest('The payer is not in this space');
-  const payer = members.find((m) => m.id === paidBy);
-  const fromPot = body.fromPot ?? (payer ? payer.role === 'OWNER' : existing.from_pot);
 
   const amount = body.amount ?? Number(existing.amount);
   // Only recompute the split when the request actually describes one.
@@ -288,11 +277,10 @@ router.patch('/:expenseId', asyncHandler(async (req, res) => {
               spent_on     = COALESCE($4::date, spent_on),
               note         = COALESCE($5, note),
               paid_by      = $6,
-              from_pot     = $7,
-              split_mode   = COALESCE($8, split_mode)
-        WHERE id = $9`,
+              split_mode   = COALESCE($7, split_mode)
+        WHERE id = $8`,
       [body.item ?? null, body.amount ?? null, body.categoryKey ?? null, body.spentOn ?? null,
-       body.note ?? null, paidBy, fromPot, body.splitMode ?? null, existing.id]
+       body.note ?? null, paidBy, body.splitMode ?? null, existing.id]
     );
 
     if (shares) {

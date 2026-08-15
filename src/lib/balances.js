@@ -4,15 +4,16 @@ import { money } from './ids.js';
 /**
  * Per-member balance for a space.
  *
- *   balance = cash handed in
- *           - cash handed back
- *           + bills they paid out of their own pocket
- *           - their share of everything bought
+ *   balance = cash handed in - cash handed back - their share of the spending
  *
- * A bill paid "from the pot" (the shared cash the account holder is keeping)
- * credits nobody — the money was already in the pot. Only someone spending
- * their OWN money is credited back, which is what puts the account holder in
- * their debt.
+ * Nobody is ever credited for paying a bill: the money came out of the shared
+ * wallet, so it is already accounted for. That keeps one invariant true for any
+ * number of people —
+ *
+ *   sum of balances = total put in - total taken out - total spent = the wallet
+ *
+ * If someone genuinely pays with their own cash, record it as a top-up for what
+ * they handed over plus the expense; the books then balance on their own.
  *
  * A negative balance means that person has consumed more than they put in,
  * i.e. they owe the group.
@@ -27,10 +28,8 @@ export async function memberBalances(spaceId) {
             m.is_active,
             COALESCE(w.credited, 0)  AS credited,
             COALESCE(w.withdrawn, 0) AS withdrawn,
-            COALESCE(p.fronted, 0)   AS fronted,
             COALESCE(s.spent, 0)     AS spent,
-            COALESCE(w.credited, 0) - COALESCE(w.withdrawn, 0)
-              + COALESCE(p.fronted, 0) - COALESCE(s.spent, 0) AS balance,
+            COALESCE(w.credited, 0) - COALESCE(w.withdrawn, 0) - COALESCE(s.spent, 0) AS balance,
             s.last_spent_on
        FROM space_members m
        LEFT JOIN (
@@ -59,12 +58,6 @@ export async function memberBalances(spaceId) {
               ) all_shares
              GROUP BY member_id
        ) s ON s.member_id = m.id
-       LEFT JOIN (
-            SELECT paid_by, SUM(amount) AS fronted
-              FROM expenses
-             WHERE space_id = $1 AND from_pot = FALSE AND paid_by IS NOT NULL
-             GROUP BY paid_by
-       ) p ON p.paid_by = m.id
       WHERE m.space_id = $1
       ORDER BY (m.role = 'OWNER') DESC, m.name`,
     [spaceId]
@@ -80,7 +73,6 @@ export async function memberBalances(spaceId) {
     hasAccount: Boolean(r.user_id),
     creditedTotal: Number(r.credited),
     withdrawnTotal: Number(r.withdrawn),
-    frontedTotal: Number(r.fronted),
     spentTotal: Number(r.spent),
     balance: money(Number(r.balance)),
     lastSpentOn: r.last_spent_on,
@@ -110,6 +102,14 @@ export function totalsFrom(members) {
 export function debtsFrom(members) {
   const holder = members.find((m) => m.role === 'OWNER');
   const transfers = [];
+
+  /**
+   * What everyone in the red has to hand back. This is measured straight off
+   * the balances, never accumulated from the suggested payments below — those
+   * can fall short when the wallet itself has gone negative, and a total that
+   * quietly disagreed with the balances is how money goes missing.
+   */
+  const totalOwed = money(members.reduce((sum, m) => sum + Math.max(-m.balance, 0), 0));
 
   if (holder) {
     for (const m of members) {
@@ -146,8 +146,16 @@ export function debtsFrom(members) {
     }
   }
 
+  const allocated = money(transfers.reduce((sum, t) => sum + t.amount, 0));
+
   return {
     settlements: transfers,
-    totalOwed: money(transfers.reduce((sum, t) => sum + t.amount, 0)),
+    totalOwed,
+    /**
+     * Debt the suggestions above could not pair with anyone — only possible
+     * when more has been spent than was ever put in, so there is nobody left
+     * in credit to be repaid. Surfaced rather than dropped.
+     */
+    unallocated: money(totalOwed - allocated),
   };
 }
