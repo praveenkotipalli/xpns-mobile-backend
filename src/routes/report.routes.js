@@ -23,32 +23,38 @@ router.get('/monthly', asyncHandler(async (req, res) => {
 
   const groupExpr = f.groupBy === 'MAIN' ? 'COALESCE(c.main_category, \'OTHERS\')' : 'e.category_key';
 
+  // Summing the shares rather than the bill total means a split expense is
+  // counted once overall, but only partly against any one person.
   const { rows } = await query(
     `SELECT EXTRACT(MONTH FROM e.spent_on)::int AS month_no,
             ${groupExpr}                        AS group_key,
             MAX(COALESCE(c.label, e.category_key)) AS group_label,
             MAX(COALESCE(c.main_category, 'OTHERS')) AS main_category,
             MAX(COALESCE(c.icon, 'pricetag'))   AS icon,
-            SUM(e.amount)                       AS total,
-            COUNT(*)::int                       AS count
-       FROM expenses e
+            SUM(es.amount)                      AS total,
+            COUNT(DISTINCT e.id)::int           AS count
+       FROM expense_shares es
+       JOIN expenses e ON e.id = es.expense_id
        LEFT JOIN categories c ON c.key = e.category_key
                              AND (c.space_id IS NULL OR c.space_id = e.space_id)
       WHERE e.space_id = $1
         AND EXTRACT(YEAR FROM e.spent_on) = $2
-        AND ($3::uuid IS NULL OR e.member_id = $3::uuid)
+        AND ($3::uuid IS NULL OR es.member_id = $3::uuid)
       GROUP BY month_no, group_key
       ORDER BY month_no, total DESC`,
     [req.space.id, f.year, f.memberId || null]
   );
 
+  // Per-person totals come from the shares, so a split bill is attributed to
+  // each person for exactly what they consumed.
   const { rows: byMember } = await query(
     `SELECT EXTRACT(MONTH FROM e.spent_on)::int AS month_no,
-            m.id, m.name, m.color, SUM(e.amount) AS total
-       FROM expenses e
-       JOIN space_members m ON m.id = e.member_id
+            m.id, m.name, m.color, SUM(es.amount) AS total
+       FROM expense_shares es
+       JOIN expenses e ON e.id = es.expense_id
+       JOIN space_members m ON m.id = es.member_id
       WHERE e.space_id = $1 AND EXTRACT(YEAR FROM e.spent_on) = $2
-        AND ($3::uuid IS NULL OR e.member_id = $3::uuid)
+        AND ($3::uuid IS NULL OR es.member_id = $3::uuid)
       GROUP BY month_no, m.id, m.name, m.color
       ORDER BY month_no, total DESC`,
     [req.space.id, f.year, f.memberId || null]
@@ -107,30 +113,34 @@ router.get('/summary', asyncHandler(async (req, res) => {
   }), req.query);
 
   const params = [req.space.id, f.month, f.year, f.memberId || null];
+  // Everything is driven by expense_shares so split bills are attributed to the
+  // right people; with no member filter the shares add back up to the bill.
+  const from = `FROM expense_shares es JOIN expenses e ON e.id = es.expense_id`;
   const where = `e.space_id = $1
      AND EXTRACT(MONTH FROM e.spent_on) = $2
      AND EXTRACT(YEAR  FROM e.spent_on) = $3
-     AND ($4::uuid IS NULL OR e.member_id = $4::uuid)`;
+     AND ($4::uuid IS NULL OR es.member_id = $4::uuid)`;
 
   const [{ rows: totalRows }, { rows: catRows }, { rows: memberRows }, { rows: mainRows }, { rows: dayRows }] =
     await Promise.all([
-      query(`SELECT COALESCE(SUM(e.amount), 0) AS total, COUNT(*)::int AS count FROM expenses e WHERE ${where}`, params),
+      query(`SELECT COALESCE(SUM(es.amount), 0) AS total, COUNT(DISTINCT e.id)::int AS count ${from} WHERE ${where}`, params),
       query(
         `SELECT e.category_key AS key, MAX(COALESCE(c.label, e.category_key)) AS label,
-                MAX(COALESCE(c.icon, 'pricetag')) AS icon, SUM(e.amount) AS total, COUNT(*)::int AS count
-           FROM expenses e
+                MAX(COALESCE(c.icon, 'pricetag')) AS icon, SUM(es.amount) AS total,
+                COUNT(DISTINCT e.id)::int AS count
+           ${from}
            LEFT JOIN categories c ON c.key = e.category_key AND (c.space_id IS NULL OR c.space_id = e.space_id)
           WHERE ${where} GROUP BY e.category_key ORDER BY total DESC`, params),
       query(
-        `SELECT m.id, m.name, m.color, SUM(e.amount) AS total, COUNT(*)::int AS count
-           FROM expenses e JOIN space_members m ON m.id = e.member_id
+        `SELECT m.id, m.name, m.color, SUM(es.amount) AS total, COUNT(DISTINCT e.id)::int AS count
+           ${from} JOIN space_members m ON m.id = es.member_id
           WHERE ${where} GROUP BY m.id, m.name, m.color ORDER BY total DESC`, params),
       query(
-        `SELECT COALESCE(c.main_category, 'OTHERS') AS key, SUM(e.amount) AS total
-           FROM expenses e
+        `SELECT COALESCE(c.main_category, 'OTHERS') AS key, SUM(es.amount) AS total
+           ${from}
            LEFT JOIN categories c ON c.key = e.category_key AND (c.space_id IS NULL OR c.space_id = e.space_id)
           WHERE ${where} GROUP BY 1 ORDER BY total DESC`, params),
-      query(`SELECT e.spent_on AS day, SUM(e.amount) AS total FROM expenses e WHERE ${where} GROUP BY day ORDER BY day`, params),
+      query(`SELECT e.spent_on AS day, SUM(es.amount) AS total ${from} WHERE ${where} GROUP BY day ORDER BY day`, params),
     ]);
 
   const total = Number(totalRows[0].total);

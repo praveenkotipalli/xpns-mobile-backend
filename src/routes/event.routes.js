@@ -3,7 +3,8 @@ import { z } from 'zod';
 import { query, withTransaction } from '../db.js';
 import { ApiError, asyncHandler, created, ok, parse } from '../lib/http.js';
 import { inviteCode, money } from '../lib/ids.js';
-import { equalShares, settlements } from '../lib/settle.js';
+import { settlements } from '../lib/settle.js';
+import { resolveShares } from '../lib/splits.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
@@ -77,7 +78,7 @@ const createEventSchema = z.object({
   endDate: dateString.optional(),
   currency: z.string().trim().max(8).default('INR'),
   spaceId: z.string().uuid().optional(),
-  /** Names of people who have no account yet — added as placeholders you can log for. */
+  /** Names of people who have no account yet - added as placeholders you can log for. */
   participants: z.array(z.string().trim().min(1).max(120)).max(50).default([]),
 });
 
@@ -109,7 +110,7 @@ router.post('/', asyncHandler(async (req, res) => {
   return created(res, { id: event.id, name: event.name, inviteCode: event.invite_code }, 'Event created');
 }));
 
-/** Join with the event's share code — you then log your own spending from your account. */
+/** Join with the event's share code - you then log your own spending from your account. */
 router.post('/join', asyncHandler(async (req, res) => {
   const body = parse(z.object({
     code: z.string().trim().toUpperCase().min(4).max(12),
@@ -314,7 +315,7 @@ router.delete('/:eventId/participants/:participantId', loadEvent, requireOrganis
           + (SELECT COUNT(*) FROM event_expense_shares WHERE participant_id = $1) AS count`,
     [p.id]
   );
-  if (Number(count) > 0) throw ApiError.badRequest(`${p.display_name} is already on some expenses — remove those first`);
+  if (Number(count) > 0) throw ApiError.badRequest(`${p.display_name} is already on some expenses - remove those first`);
 
   await query('DELETE FROM event_participants WHERE id = $1', [p.id]);
   return ok(res, null, `${p.display_name} removed`);
@@ -340,35 +341,17 @@ const eventExpenseSchema = z.object({
 });
 
 /** Normalise either split mode into a [{participantId, amount}] list that sums to `amount`. */
-function resolveShares(body, validIds) {
-  if (body.splitMode === 'EQUAL') {
-    const ids = body.participantIds?.length ? body.participantIds : [...validIds];
-    for (const id of ids) if (!validIds.has(id)) throw ApiError.badRequest('A selected person is not in this event');
-    const amounts = equalShares(body.amount, ids.length);
-    return ids.map((participantId, i) => ({ participantId, amount: amounts[i] }));
-  }
-
-  if (!body.shares?.length) throw ApiError.badRequest('Enter how much each person owes');
-
-  const seen = new Set();
-  for (const s of body.shares) {
-    if (!validIds.has(s.participantId)) throw ApiError.badRequest('A selected person is not in this event');
-    if (seen.has(s.participantId)) throw ApiError.badRequest('The same person is listed twice');
-    seen.add(s.participantId);
-  }
-
-  const shares = body.shares.filter((s) => s.amount > 0).map((s) => ({ ...s, amount: money(s.amount) }));
-  if (!shares.length) throw ApiError.badRequest('At least one person must have a share above zero');
-
-  const sum = money(shares.reduce((t, s) => t + s.amount, 0));
-  if (Math.abs(sum - money(body.amount)) > 0.01) {
-    throw ApiError.badRequest(`Shares add up to ${sum.toFixed(2)} but the expense is ${money(body.amount).toFixed(2)}`);
-  }
-  return shares;
+function eventShares(body, validIds) {
+  return resolveShares({
+    mode: body.splitMode,
+    amount: body.amount,
+    ids: body.participantIds,
+    shares: body.shares?.map((s) => ({ id: s.participantId, amount: s.amount })),
+  }, validIds).map((s) => ({ participantId: s.id, amount: s.amount }));
 }
 
 router.post('/:eventId/expenses', loadEvent, asyncHandler(async (req, res) => {
-  if (req.event.status === 'SETTLED') throw ApiError.badRequest('This event is settled — reopen it to add expenses');
+  if (req.event.status === 'SETTLED') throw ApiError.badRequest('This event is settled - reopen it to add expenses');
   const body = parse(eventExpenseSchema, req.body);
 
   const { rows: participants } = await query(
@@ -377,7 +360,7 @@ router.post('/:eventId/expenses', loadEvent, asyncHandler(async (req, res) => {
   const validIds = new Set(participants.map((p) => p.id));
   if (!validIds.has(body.paidBy)) throw ApiError.badRequest('The payer is not in this event');
 
-  const shares = resolveShares(body, validIds);
+  const shares = eventShares(body, validIds);
 
   const expenseId = await withTransaction(async (client) => {
     const { rows: [x] } = await client.query(
@@ -413,7 +396,7 @@ router.patch('/:eventId/expenses/:expenseId', loadEvent, asyncHandler(async (req
   const validIds = new Set(participants.map((p) => p.id));
   if (!validIds.has(body.paidBy)) throw ApiError.badRequest('The payer is not in this event');
 
-  const shares = resolveShares(body, validIds);
+  const shares = eventShares(body, validIds);
 
   await withTransaction(async (client) => {
     await client.query(

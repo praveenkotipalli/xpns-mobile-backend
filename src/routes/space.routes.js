@@ -3,13 +3,15 @@ import { z } from 'zod';
 import { query, withTransaction } from '../db.js';
 import { ApiError, asyncHandler, created, ok, parse } from '../lib/http.js';
 import { inviteCode } from '../lib/ids.js';
-import { memberBalances, totalsFrom } from '../lib/balances.js';
+import { debtsFrom, memberBalances, totalsFrom } from '../lib/balances.js';
 import { requireAuth, requireSpace, requireSpaceOwner } from '../middleware/auth.js';
 
 const router = Router();
 router.use(requireAuth);
 
-const MEMBER_COLORS = ['#6C8CFF', '#31C48D', '#F98080', '#FDBA8C', '#AC94FA', '#16BDCA', '#E879F9', '#FACC15'];
+// Avatar/identity colours, chosen to stay legible on a pure-black background.
+// White first so the owner matches the app's monochrome accent.
+const MEMBER_COLORS = ['#FFFFFF', '#3ECF8E', '#FF6B6B', '#F5A623', '#B388FF', '#4DD0E1', '#F06292', '#A1A1A1'];
 
 /* ------------------------------------------------------------------ spaces */
 
@@ -111,9 +113,19 @@ router.get('/summary', requireSpace, asyncHandler(async (req, res) => {
   );
 
   const { rows: recent } = await query(
-    `SELECT e.id, e.item, e.amount, e.spent_on, e.category_key, m.name AS member_name, m.color AS member_color
+    `SELECT e.id, e.item, e.amount, e.spent_on, e.category_key, e.split_mode,
+            payer.name AS paid_by_name, payer.color AS paid_by_color,
+            sh.people, sh.names, sh.first_color
        FROM expenses e
-       JOIN space_members m ON m.id = e.member_id
+       LEFT JOIN space_members payer ON payer.id = e.paid_by
+       LEFT JOIN LATERAL (
+            SELECT COUNT(*)::int AS people,
+                   STRING_AGG(m.name, ', ' ORDER BY m.name) AS names,
+                   MIN(m.color) AS first_color
+              FROM expense_shares es
+              JOIN space_members m ON m.id = es.member_id
+             WHERE es.expense_id = e.id
+       ) sh ON TRUE
       WHERE e.space_id = $1
       ORDER BY e.spent_on DESC, e.created_at DESC
       LIMIT 8`,
@@ -139,18 +151,47 @@ router.get('/summary', requireSpace, asyncHandler(async (req, res) => {
     monthSpent: Number(monthRow.spent),
     monthExpenseCount: monthRow.count,
     members,
+    debts: debtsFrom(members),
     recentExpenses: recent.map((r) => ({
       id: r.id,
       item: r.item,
       amount: Number(r.amount),
       spentOn: r.spent_on,
       categoryKey: r.category_key,
-      memberName: r.member_name,
-      memberColor: r.member_color,
+      isSplit: (r.people ?? 0) > 1,
+      peopleCount: r.people ?? 0,
+      paidByName: r.paid_by_name,
+      // "Aijaz" for a solo expense, "3 people" once it is shared.
+      memberName: (r.people ?? 0) > 1 ? `${r.people} people` : r.names,
+      memberColor: (r.people ?? 0) > 1 ? r.paid_by_color || r.first_color : r.first_color,
     })),
     openEvents: openEvents.map((e) => ({
       id: e.id, name: e.name, type: e.type, startDate: e.start_date,
       participantCount: e.participant_count, total: Number(e.total),
+    })),
+  });
+}));
+
+/**
+ * Who owes whom right now.
+ *
+ * Anyone whose balance has gone negative has consumed more than they put in,
+ * so they owe whoever is holding the shared cash. People still in credit do
+ * not appear — their own money already covers their share.
+ */
+router.get('/debts', requireSpace, asyncHandler(async (req, res) => {
+  const members = await memberBalances(req.space.id);
+  const { settlements, totalOwed } = debtsFrom(members);
+
+  const mine = req.space.memberId;
+  return ok(res, {
+    myMemberId: mine,
+    totalOwed,
+    settlements,
+    iOwe: settlements.filter((s) => s.fromMemberId === mine),
+    owedToMe: settlements.filter((s) => s.toMemberId === mine),
+    members: members.map((m) => ({
+      id: m.id, name: m.name, color: m.color, balance: m.balance, isMe: m.id === mine,
     })),
   });
 }));

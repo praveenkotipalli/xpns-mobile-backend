@@ -1,13 +1,21 @@
 import { query } from '../db.js';
+import { money } from './ids.js';
 
 /**
  * Per-member balance for a space.
  *
- * balance = (money handed in) - (money handed back) - (what that person consumed)
+ *   balance = cash handed in
+ *           - cash handed back
+ *           + bills they paid out of their own pocket
+ *           - their share of everything bought
  *
- * TOPUP and ADJUST credit the member, WITHDRAW debits them (cash returned).
- * A negative balance means that person has consumed more than they put in —
- * i.e. they owe the account holder that much.
+ * A bill paid "from the pot" (the shared cash the account holder is keeping)
+ * credits nobody — the money was already in the pot. Only someone spending
+ * their OWN money is credited back, which is what puts the account holder in
+ * their debt.
+ *
+ * A negative balance means that person has consumed more than they put in,
+ * i.e. they owe the group.
  */
 export async function memberBalances(spaceId) {
   const { rows } = await query(
@@ -17,11 +25,13 @@ export async function memberBalances(spaceId) {
             m.role,
             m.user_id,
             m.is_active,
-            COALESCE(w.credited, 0)   AS credited,
-            COALESCE(w.withdrawn, 0)  AS withdrawn,
-            COALESCE(e.spent, 0)      AS spent,
-            COALESCE(w.credited, 0) - COALESCE(w.withdrawn, 0) - COALESCE(e.spent, 0) AS balance,
-            e.last_spent_on
+            COALESCE(w.credited, 0)  AS credited,
+            COALESCE(w.withdrawn, 0) AS withdrawn,
+            COALESCE(p.fronted, 0)   AS fronted,
+            COALESCE(s.spent, 0)     AS spent,
+            COALESCE(w.credited, 0) - COALESCE(w.withdrawn, 0)
+              + COALESCE(p.fronted, 0) - COALESCE(s.spent, 0) AS balance,
+            s.last_spent_on
        FROM space_members m
        LEFT JOIN (
             SELECT member_id,
@@ -32,11 +42,29 @@ export async function memberBalances(spaceId) {
              GROUP BY member_id
        ) w ON w.member_id = m.id
        LEFT JOIN (
+            -- Shares are authoritative, but fall back to the pre-split column
+            -- for any row that has none, so an expense can never go uncounted.
             SELECT member_id, SUM(amount) AS spent, MAX(spent_on) AS last_spent_on
-              FROM expenses
-             WHERE space_id = $1
+              FROM (
+                SELECT es.member_id, es.amount, e.spent_on
+                  FROM expense_shares es
+                  JOIN expenses e ON e.id = es.expense_id
+                 WHERE e.space_id = $1
+                UNION ALL
+                SELECT e.member_id, e.amount, e.spent_on
+                  FROM expenses e
+                 WHERE e.space_id = $1
+                   AND e.member_id IS NOT NULL
+                   AND NOT EXISTS (SELECT 1 FROM expense_shares es WHERE es.expense_id = e.id)
+              ) all_shares
              GROUP BY member_id
-       ) e ON e.member_id = m.id
+       ) s ON s.member_id = m.id
+       LEFT JOIN (
+            SELECT paid_by, SUM(amount) AS fronted
+              FROM expenses
+             WHERE space_id = $1 AND from_pot = FALSE AND paid_by IS NOT NULL
+             GROUP BY paid_by
+       ) p ON p.paid_by = m.id
       WHERE m.space_id = $1
       ORDER BY (m.role = 'OWNER') DESC, m.name`,
     [spaceId]
@@ -52,8 +80,9 @@ export async function memberBalances(spaceId) {
     hasAccount: Boolean(r.user_id),
     creditedTotal: Number(r.credited),
     withdrawnTotal: Number(r.withdrawn),
+    frontedTotal: Number(r.fronted),
     spentTotal: Number(r.spent),
-    balance: Number(r.balance),
+    balance: money(Number(r.balance)),
     lastSpentOn: r.last_spent_on,
   }));
 }
@@ -61,11 +90,64 @@ export async function memberBalances(spaceId) {
 export function totalsFrom(members) {
   return members.reduce(
     (acc, m) => ({
-      totalBalance: acc.totalBalance + m.balance,
-      totalCredited: acc.totalCredited + m.creditedTotal,
-      totalWithdrawn: acc.totalWithdrawn + m.withdrawnTotal,
-      totalSpent: acc.totalSpent + m.spentTotal,
+      totalBalance: money(acc.totalBalance + m.balance),
+      totalCredited: money(acc.totalCredited + m.creditedTotal),
+      totalWithdrawn: money(acc.totalWithdrawn + m.withdrawnTotal),
+      totalSpent: money(acc.totalSpent + m.spentTotal),
     }),
     { totalBalance: 0, totalCredited: 0, totalWithdrawn: 0, totalSpent: 0 }
   );
+}
+
+/**
+ * Who should pay whom to square everyone up.
+ *
+ * Unlike an event — where anyone can pay anyone — every rupee here physically
+ * sits with the account holder. So debts are anchored on them: whoever has
+ * overspent hands cash to the account holder, not to each other. Members whose
+ * own money still covers their spending do not appear at all.
+ */
+export function debtsFrom(members) {
+  const holder = members.find((m) => m.role === 'OWNER');
+  const transfers = [];
+
+  if (holder) {
+    for (const m of members) {
+      if (m.id === holder.id || m.balance >= -0.009) continue;
+      transfers.push({
+        fromMemberId: m.id,
+        fromName: m.name,
+        toMemberId: holder.id,
+        toName: holder.name,
+        amount: money(-m.balance),
+      });
+    }
+
+    // The account holder can go into the red too, by spending money that
+    // belongs to the people still in credit. Name them largest first.
+    if (holder.balance < -0.009) {
+      let remaining = money(-holder.balance);
+      const creditors = members
+        .filter((m) => m.id !== holder.id && m.balance > 0.009)
+        .sort((a, b) => b.balance - a.balance);
+
+      for (const creditor of creditors) {
+        if (remaining <= 0.009) break;
+        const pay = money(Math.min(remaining, creditor.balance));
+        transfers.push({
+          fromMemberId: holder.id,
+          fromName: holder.name,
+          toMemberId: creditor.id,
+          toName: creditor.name,
+          amount: pay,
+        });
+        remaining = money(remaining - pay);
+      }
+    }
+  }
+
+  return {
+    settlements: transfers,
+    totalOwed: money(transfers.reduce((sum, t) => sum + t.amount, 0)),
+  };
 }

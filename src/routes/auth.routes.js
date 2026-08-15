@@ -50,7 +50,7 @@ router.post('/register', asyncHandler(async (req, res) => {
 
     await client.query(
       `INSERT INTO space_members (space_id, user_id, name, role, color)
-       VALUES ($1, $2, $3, 'OWNER', '#6C8CFF')`,
+       VALUES ($1, $2, $3, 'OWNER', '#FFFFFF')`,
       [space.id, user.id, user.name]
     );
 
