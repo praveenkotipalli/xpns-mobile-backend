@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query, withTransaction } from '../db.js';
 import { ApiError, asyncHandler, created, ok, parse } from '../lib/http.js';
-import { inviteCode } from '../lib/ids.js';
+import { inviteCode, money } from '../lib/ids.js';
 import { debtsFrom, memberBalances, totalsFrom } from '../lib/balances.js';
 import { requireAuth, requireSpace, requireSpaceOwner } from '../middleware/auth.js';
 
@@ -104,6 +104,17 @@ router.get('/summary', requireSpace, asyncHandler(async (req, res) => {
   const members = await memberBalances(req.space.id);
   const totals = totalsFrom(members);
 
+  /**
+   * Two different true answers to "how much have we got":
+   *
+   *   totalBalance   — the cash actually sitting in the account right now.
+   *   settledBalance — what it would hold once everyone in the red has paid up.
+   *
+   * Summing only the positive balances gives the second: the people in credit
+   * are owed exactly that much, and the shortfall is what the debtors owe.
+   */
+  const settledBalance = money(members.reduce((sum, m) => sum + Math.max(m.balance, 0), 0));
+
   const { rows: [monthRow] } = await query(
     `SELECT COALESCE(SUM(amount), 0) AS spent, COUNT(*)::int AS count
        FROM expenses
@@ -147,6 +158,7 @@ router.get('/summary', requireSpace, asyncHandler(async (req, res) => {
   return ok(res, {
     space: { id: req.space.id, name: req.space.name, currency: req.space.currency, inviteCode: req.space.inviteCode, role: req.space.role },
     ...totals,
+    settledBalance,
     myMemberId: req.space.memberId,
     monthSpent: Number(monthRow.spent),
     monthExpenseCount: monthRow.count,
