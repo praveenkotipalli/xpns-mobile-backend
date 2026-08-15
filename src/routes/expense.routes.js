@@ -99,9 +99,11 @@ router.post('/', asyncHandler(async (req, res) => {
 
   const balances = await memberBalances(req.space.id);
   const byId = new Map(balances.map((m) => [m.id, m]));
+  // Debt, not a negative balance: somebody can be in credit overall and still
+  // owe for what they consumed before they last topped up.
   const overdrawn = shares
     .map((s) => byId.get(s.id))
-    .filter((m) => m && m.balance < 0);
+    .filter((m) => m && m.debt > 0.009);
 
   return created(res, {
     id: expenseId,
@@ -117,7 +119,7 @@ router.post('/', asyncHandler(async (req, res) => {
     debts: debtsFrom(balances),
     warning: overdrawn.length
       ? overdrawn
-          .map((m) => `${m.name} is now at ${m.balance.toFixed(2)} and owes that back.`)
+          .map((m) => `${m.name} now owes ${m.debt.toFixed(2)}.`)
           .join(' ')
       : null,
   }, 'Expense saved');

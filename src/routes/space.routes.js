@@ -13,6 +13,8 @@ router.use(requireAuth);
 // White first so the owner matches the app's monochrome accent.
 const MEMBER_COLORS = ['#FFFFFF', '#3ECF8E', '#FF6B6B', '#F5A623', '#B388FF', '#4DD0E1', '#F06292', '#A1A1A1'];
 
+const dateString = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD');
+
 /* ------------------------------------------------------------------ spaces */
 
 router.get('/', asyncHandler(async (req, res) => {
@@ -103,17 +105,20 @@ router.post('/join', asyncHandler(async (req, res) => {
 router.get('/summary', requireSpace, asyncHandler(async (req, res) => {
   const members = await memberBalances(req.space.id);
   const totals = totalsFrom(members);
+  const debts = debtsFrom(members);
 
   /**
    * Two different true answers to "how much have we got":
    *
    *   totalBalance   — the cash actually sitting in the account right now.
-   *   settledBalance — what it would hold once everyone in the red has paid up.
+   *   settledBalance — what it would hold once every outstanding debt is paid.
    *
-   * Summing only the positive balances gives the second: the people in credit
-   * are owed exactly that much, and the shortfall is what the debtors owe.
+   * The second is simply the first plus everything still owed, because settling
+   * a debt is cash arriving. It is no longer "the sum of the positive balances"
+   * — a debt now outlives the top-up that used to hide it, so the two figures
+   * would disagree for anyone who has overspent and put money in since.
    */
-  const settledBalance = money(members.reduce((sum, m) => sum + Math.max(m.balance, 0), 0));
+  const settledBalance = money(totals.totalBalance + debts.totalOwed);
 
   const { rows: [monthRow] } = await query(
     `SELECT COALESCE(SUM(amount), 0) AS spent, COUNT(*)::int AS count
@@ -143,6 +148,20 @@ router.get('/summary', requireSpace, asyncHandler(async (req, res) => {
     [req.space.id]
   );
 
+  // The money-in side of the dashboard, mirroring recent expenses. Only
+  // credits: a withdrawal is money leaving, and lives in the full history.
+  const { rows: recentMoney } = await query(
+    `SELECT w.id, w.type, w.amount, w.note, w.txn_date,
+            m.name AS member_name, m.color AS member_color
+       FROM wallet_transactions w
+       JOIN space_members m ON m.id = w.member_id
+      WHERE w.space_id = $1
+        AND w.type IN ('TOPUP', 'ADJUST')
+      ORDER BY w.txn_date DESC, w.created_at DESC
+      LIMIT 8`,
+    [req.space.id]
+  );
+
   const { rows: openEvents } = await query(
     `SELECT e.id, e.name, e.type, e.start_date,
             (SELECT COUNT(*)::int FROM event_participants p WHERE p.event_id = e.id) AS participant_count,
@@ -163,7 +182,16 @@ router.get('/summary', requireSpace, asyncHandler(async (req, res) => {
     monthSpent: Number(monthRow.spent),
     monthExpenseCount: monthRow.count,
     members,
-    debts: debtsFrom(members),
+    debts,
+    recentMoney: recentMoney.map((r) => ({
+      id: r.id,
+      type: r.type,
+      amount: Number(r.amount),
+      note: r.note,
+      txnDate: r.txn_date,
+      memberName: r.member_name,
+      memberColor: r.member_color,
+    })),
     recentExpenses: recent.map((r) => ({
       id: r.id,
       item: r.item,
@@ -187,25 +215,141 @@ router.get('/summary', requireSpace, asyncHandler(async (req, res) => {
 /**
  * Who owes whom right now.
  *
- * Anyone whose balance has gone negative has consumed more than they put in,
- * so they owe whoever is holding the shared cash. People still in credit do
- * not appear — their own money already covers their share.
+ * Anyone who has consumed more than they put in owes whoever is holding the
+ * shared cash, and keeps owing it until the debt is cleared through
+ * `/debts/settle` — topping the wallet up no longer counts as paying it back.
  */
 router.get('/debts', requireSpace, asyncHandler(async (req, res) => {
   const members = await memberBalances(req.space.id);
-  const { settlements, totalOwed } = debtsFrom(members);
+  const { settlements, totalOwed, unallocated } = debtsFrom(members);
 
   const mine = req.space.memberId;
   return ok(res, {
     myMemberId: mine,
     totalOwed,
+    unallocated,
     settlements,
     iOwe: settlements.filter((s) => s.fromMemberId === mine),
     owedToMe: settlements.filter((s) => s.toMemberId === mine),
     members: members.map((m) => ({
-      id: m.id, name: m.name, color: m.color, balance: m.balance, isMe: m.id === mine,
+      id: m.id, name: m.name, color: m.color, balance: m.balance, debt: m.debt, isMe: m.id === mine,
     })),
   });
+}));
+
+/* ------------------------------------------------------------ clearing debts */
+
+const settleSchema = z.object({
+  memberId: z.string().uuid('must be a member id'),
+  amount: z.coerce.number().positive('must be greater than zero').max(99_999_999),
+  note: z.string().trim().max(255).optional(),
+  settledOn: dateString.optional(),
+  spaceId: z.string().uuid().optional(),
+});
+
+/**
+ * Record that someone has paid back what they owed — all of it or part.
+ *
+ * This is the only thing that reduces a debt. Adding money to the wallet does
+ * not, on purpose: cash handed over for next week's shopping is not a
+ * repayment, and treating it as one used to erase the debt with no record of
+ * it ever having been settled.
+ *
+ * The cash lands in the wallet as well, so the pot and the member's balance
+ * both go up by the amount — they really did hand it over.
+ */
+router.post('/debts/settle', requireSpace, asyncHandler(async (req, res) => {
+  const body = parse(settleSchema, req.body);
+
+  const before = await memberBalances(req.space.id);
+  const member = before.find((m) => m.id === body.memberId);
+  if (!member) throw ApiError.notFound('That member is not in this space');
+  if (member.debt <= 0.009) throw ApiError.badRequest(`${member.name} does not owe anything right now`);
+
+  // Overpaying would push the debt below zero and read as credit that was never
+  // given. Partial is fine; more than the whole debt is not.
+  if (body.amount - member.debt > 0.009) {
+    throw ApiError.badRequest(
+      `${member.name} only owes ${member.debt.toFixed(2)} — clear that much or less`
+    );
+  }
+
+  const { rows: [row] } = await query(
+    `INSERT INTO debt_settlements (space_id, member_id, amount, note, settled_on, created_by)
+     VALUES ($1, $2, $3, $4, COALESCE($5::date, CURRENT_DATE), $6)
+     RETURNING *`,
+    [req.space.id, body.memberId, body.amount, body.note || null, body.settledOn || null, req.user.id]
+  );
+
+  const members = await memberBalances(req.space.id);
+  const after = members.find((m) => m.id === body.memberId);
+
+  return created(res, {
+    settlement: {
+      id: row.id,
+      memberId: row.member_id,
+      memberName: member.name,
+      memberColor: member.color,
+      amount: Number(row.amount),
+      note: row.note,
+      settledOn: row.settled_on,
+      isCash: row.is_cash,
+      recordedBy: req.user.name,
+    },
+    members,
+    debts: debtsFrom(members),
+  }, after && after.debt > 0.009
+    ? `${member.name} still owes ${after.debt.toFixed(2)}`
+    : `${member.name} is all square`);
+}));
+
+/** Every debt that has been cleared, newest first. */
+router.get('/debts/history', requireSpace, asyncHandler(async (req, res) => {
+  const filters = parse(z.object({
+    memberId: z.string().uuid().optional(),
+    limit: z.coerce.number().int().min(1).max(200).default(100),
+  }), req.query);
+
+  const { rows } = await query(
+    `SELECT d.id, d.amount, d.note, d.settled_on, d.is_cash,
+            m.id AS member_id, m.name AS member_name, m.color AS member_color,
+            u.name AS recorded_by
+       FROM debt_settlements d
+       JOIN space_members m ON m.id = d.member_id
+       LEFT JOIN users u ON u.id = d.created_by
+      WHERE d.space_id = $1
+        AND ($2::uuid IS NULL OR d.member_id = $2::uuid)
+      ORDER BY d.settled_on DESC, d.created_at DESC
+      LIMIT $3`,
+    [req.space.id, filters.memberId || null, filters.limit]
+  );
+
+  return ok(res, rows.map((r) => ({
+    id: r.id,
+    memberId: r.member_id,
+    memberName: r.member_name,
+    memberColor: r.member_color,
+    amount: Number(r.amount),
+    note: r.note,
+    settledOn: r.settled_on,
+    isCash: r.is_cash,
+    recordedBy: r.recorded_by,
+  })));
+}));
+
+/** Undo a clearance — the debt comes back and the cash leaves the wallet again. */
+router.delete('/debts/settle/:settlementId', requireSpace, asyncHandler(async (req, res) => {
+  // `is_cash = TRUE` guards the opening balances written by migration 005:
+  // deleting one of those would resurrect a debt that was settled long before
+  // the app started tracking them.
+  const { rowCount } = await query(
+    'DELETE FROM debt_settlements WHERE id = $1 AND space_id = $2 AND is_cash = TRUE',
+    [req.params.settlementId, req.space.id]
+  );
+  if (!rowCount) throw ApiError.notFound('That clearance is not there, or is a carried-forward entry');
+
+  const members = await memberBalances(req.space.id);
+  return ok(res, { members, debts: debtsFrom(members) }, 'Clearance removed');
 }));
 
 /* ----------------------------------------------------------------- members */
@@ -231,6 +375,7 @@ router.post('/members', requireSpace, asyncHandler(async (req, res) => {
   return created(res, {
     id: member.id, name: member.name, color: member.color, role: member.role,
     hasAccount: false, balance: 0, creditedTotal: 0, withdrawnTotal: 0, spentTotal: 0,
+    incurredDebt: 0, settledDebt: 0, debt: 0,
   }, `${member.name} added`);
 }));
 
