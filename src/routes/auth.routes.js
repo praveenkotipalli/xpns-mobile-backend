@@ -4,6 +4,7 @@ import { z } from 'zod';
 import { query, withTransaction } from '../db.js';
 import { ApiError, asyncHandler, created, ok, parse } from '../lib/http.js';
 import { inviteCode } from '../lib/ids.js';
+import { deleteAccount } from '../lib/accounts.js';
 import { requireAuth, signToken } from '../middleware/auth.js';
 
 const router = Router();
@@ -126,6 +127,27 @@ router.post('/change-password', requireAuth, asyncHandler(async (req, res) => {
   ]);
 
   return ok(res, null, 'Password updated');
+}));
+
+const deleteAccountSchema = z.object({
+  password: z.string().min(1, 'is required'),
+});
+
+/**
+ * Delete the caller's account for good. Asks for the password again so a phone
+ * left unlocked, or a leaked token, cannot wipe someone's books. A wrong
+ * password is a 400, not a 401: the app logs out on any 401.
+ */
+router.post('/delete-account', requireAuth, asyncHandler(async (req, res) => {
+  const body = parse(deleteAccountSchema, req.body);
+  const { rows: [user] } = await query('SELECT password_hash FROM users WHERE id = $1', [req.user.id]);
+
+  if (!(await bcrypt.compare(body.password, user.password_hash))) {
+    throw ApiError.badRequest('Password is incorrect');
+  }
+
+  await withTransaction((client) => deleteAccount(client, req.user.id));
+  return ok(res, null, 'Account deleted');
 }));
 
 export default router;

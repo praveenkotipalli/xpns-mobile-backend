@@ -36,14 +36,14 @@ async function main() {
       ran += 1;
     } catch (err) {
       await client.query('ROLLBACK');
-      console.error(`\n[xpns] Migration failed: ${file}\n`, err.message);
+      console.error(`\n[xpnz] Migration failed: ${file}\n`, err.message);
       process.exit(1);
     } finally {
       client.release();
     }
   }
 
-  console.log(ran === 0 ? '\n[xpns] Database already up to date.' : `\n[xpns] Applied ${ran} migration(s).`);
+  console.log(ran === 0 ? '\n[xpnz] Database already up to date.' : `\n[xpnz] Applied ${ran} migration(s).`);
   await pool.end();
 }
 

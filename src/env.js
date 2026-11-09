@@ -3,8 +3,8 @@ import 'dotenv/config';
 function required(name) {
   const value = process.env[name];
   if (!value) {
-    console.error(`\n[xpns] Missing required env var: ${name}`);
-    console.error('[xpns] Copy server/.env.example to server/.env and fill it in.\n');
+    console.error(`\n[xpnz] Missing required env var: ${name}`);
+    console.error('[xpnz] Copy server/.env.example to server/.env and fill it in.\n');
     process.exit(1);
   }
   return value;
@@ -50,8 +50,8 @@ export function normalizeDatabaseUrl(raw) {
     const rest = params.toString();
     if (rest) url += `?${rest}`;
 
-    console.warn('[xpns] DATABASE_URL was a JDBC string; converted it to a postgresql:// URL.');
-    console.warn('[xpns] Use the "Node.js" connection string from Neon to silence this.');
+    console.warn('[xpnz] DATABASE_URL was a JDBC string; converted it to a postgresql:// URL.');
+    console.warn('[xpnz] Use the "Node.js" connection string from Neon to silence this.');
   }
 
   // Catch the remaining ways a bad value produces a confusing ECONNREFUSED.
@@ -59,13 +59,13 @@ export function normalizeDatabaseUrl(raw) {
   try {
     host = new URL(url).hostname;
   } catch {
-    console.error(`\n[xpns] DATABASE_URL is not a valid URL.`);
-    console.error('[xpns] Expected: postgresql://user:password@host/dbname?sslmode=require\n');
+    console.error(`\n[xpnz] DATABASE_URL is not a valid URL.`);
+    console.error('[xpnz] Expected: postgresql://user:password@host/dbname?sslmode=require\n');
     process.exit(1);
   }
 
   if (!host) {
-    console.error('\n[xpns] DATABASE_URL has no host — check for typos or stray quotes.\n');
+    console.error('\n[xpnz] DATABASE_URL has no host — check for typos or stray quotes.\n');
     process.exit(1);
   }
 
@@ -78,7 +78,24 @@ export const env = {
   jwtSecret: required('JWT_SECRET'),
   jwtExpiresIn: process.env.JWT_EXPIRES_IN || '30d',
   nodeEnv: process.env.NODE_ENV || 'development',
+  // Shown on the privacy and delete-account pages. Optional: without it they
+  // point people at the contact email on the Play listing instead.
+  supportEmail: process.env.SUPPORT_EMAIL?.trim() || null,
+  // "Today" for a new entry and "this month" on the dashboard. The server runs
+  // in UTC, so without this anything recorded in India between midnight and
+  // 5:30 am landed on the previous day — or the previous month on the 1st.
+  timezone: validTimezone(process.env.APP_TIMEZONE?.trim() || 'Asia/Kolkata'),
 };
 
+function validTimezone(tz) {
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: tz });
+    return tz;
+  } catch {
+    console.warn(`[xpnz] APP_TIMEZONE "${tz}" is not a valid IANA time zone; using UTC.`);
+    return 'UTC';
+  }
+}
+
 // Log where we are connecting (never the password) so a bad deploy is obvious.
-console.log(`[xpns] Database host: ${new URL(env.databaseUrl).hostname}`);
+console.log(`[xpnz] Database host: ${new URL(env.databaseUrl).hostname}`);

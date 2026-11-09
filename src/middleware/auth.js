@@ -27,14 +27,43 @@ export const requireAuth = asyncHandler(async (req, _res, next) => {
   next();
 });
 
-/**
- * Resolves the space the caller is acting in and asserts membership.
- * Space comes from ?spaceId / body.spaceId, else the caller's first space.
- * Populates req.space = { id, name, currency, memberId, role }.
- */
-export const requireSpace = asyncHandler(async (req, _res, next) => {
-  const requested = req.query.spaceId || req.body?.spaceId || req.params.spaceId || null;
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * The space a request names, from the URL, the query string or the body.
+ *
+ * The app sends it as `?spaceId=`; some screens also put it in the body. When
+ * both are present they must agree — otherwise the membership check would run
+ * against one space while the handler wrote to the other.
+ */
+export function requestedSpaceId(req) {
+  const named = [req.params?.spaceId, req.query?.spaceId, req.body?.spaceId]
+    .filter((value) => value !== undefined && value !== null && value !== '');
+
+  for (const value of named) {
+    if (typeof value !== 'string' || !UUID.test(value)) {
+      throw ApiError.badRequest('spaceId is not a valid space id');
+    }
+  }
+  if (new Set(named.map((id) => id.toLowerCase())).size > 1) {
+    throw ApiError.badRequest('The request names two different spaces');
+  }
+  return named[0] || null;
+}
+
+/**
+ * The caller's membership in one space, or null.
+ *
+ * Isolation rule: a request acts in the space it names, and nowhere else. The
+ * old fallback quietly picked the caller's *oldest* space whenever a request
+ * did not name one, so money moved from the Money tab landed in a different
+ * space from the one on screen and seemed to vanish. Now a space is only
+ * inferred when there is no choice to make — the caller belongs to exactly one.
+ *
+ * `{ strict: false }` returns null instead of throwing, for screens that only
+ * show the shared side as context.
+ */
+export async function resolveSpace(userId, requested, { strict = true } = {}) {
   const { rows } = await query(
     `SELECT s.id, s.name, s.currency, s.invite_code, s.owner_id,
             m.id AS member_id, m.role
@@ -42,18 +71,22 @@ export const requireSpace = asyncHandler(async (req, _res, next) => {
        JOIN space_members m ON m.space_id = s.id AND m.user_id = $1
       WHERE ($2::uuid IS NULL OR s.id = $2::uuid)
       ORDER BY s.created_at
-      LIMIT 1`,
-    [req.user.id, requested]
+      LIMIT 2`,
+    [userId, requested]
   );
 
-  if (!rows[0]) {
-    throw requested
-      ? ApiError.forbidden('You are not a member of that space')
-      : ApiError.notFound('You have no space yet');
+  let problem = null;
+  if (requested && !rows.length) problem = ApiError.forbidden('You are not a member of that space');
+  else if (!rows.length) problem = ApiError.notFound('You have no space yet');
+  else if (rows.length > 1) problem = ApiError.badRequest('Choose which space this is for');
+
+  if (problem) {
+    if (strict) throw problem;
+    return null;
   }
 
   const s = rows[0];
-  req.space = {
+  return {
     id: s.id,
     name: s.name,
     currency: s.currency,
@@ -62,6 +95,14 @@ export const requireSpace = asyncHandler(async (req, _res, next) => {
     memberId: s.member_id,
     role: s.role,
   };
+}
+
+/**
+ * Resolves the space the caller is acting in and asserts membership.
+ * Populates req.space = { id, name, currency, inviteCode, ownerId, memberId, role }.
+ */
+export const requireSpace = asyncHandler(async (req, _res, next) => {
+  req.space = await resolveSpace(req.user.id, requestedSpaceId(req));
   next();
 });
 

@@ -29,9 +29,18 @@ import { money } from './ids.js';
  * for next week's shopping raises the balance and leaves `incurred` untouched,
  * so the debt stays on the books until someone clears it on purpose and the
  * clearance is recorded with a date and a note. See migration 005.
+ *
+ * **Nobody owes themselves.** The account holder keeps the cash, so when they
+ * spend more than they put in, the only people they can owe are the ones whose
+ * money is sitting in the pot. If nobody else is in credit, the holder simply
+ * paid out of their own pocket — that is not a debt, and it used to show up
+ * as "you owe ₹500" on a space with nobody else in it. See `capHolderDebt`.
+ *
+ * `db` is anything with a pg-style `query` — a transaction's client, so a
+ * caller can read balances under the same lock it writes with.
  */
-export async function memberBalances(spaceId) {
-  const { rows } = await query(
+export async function memberBalances(spaceId, db = { query }) {
+  const { rows } = await db.query(
     `WITH shares AS (
           -- Shares are authoritative, but fall back to the pre-split column
           -- for any row that has none, so an expense can never go uncounted.
@@ -120,7 +129,7 @@ export async function memberBalances(spaceId) {
     [spaceId]
   );
 
-  return rows.map((r) => ({
+  return capHolderDebt(rows.map((r) => ({
     id: r.id,
     name: r.name,
     color: r.color,
@@ -139,7 +148,30 @@ export async function memberBalances(spaceId) {
     /** What is still on the books — the number the app calls a debt. */
     debt: money(Number(r.owed)),
     lastSpentOn: r.last_spent_on,
-  }));
+  })));
+}
+
+/**
+ * The account holder's debt is only ever to the people whose money they spent.
+ *
+ *   holder owes = min(what their ledger says, everyone else's money still in the pot)
+ *
+ * Alone in a space, that is always zero: spending more than you put in just
+ * means you paid from your own pocket. With a friend whose ₹1,000 is in the
+ * pot, spending ₹600 of it on yourself is a real ₹600 debt — to them, and
+ * `debtsFrom` names them. Everyone else's debt is untouched: they owe the
+ * holder, who is a different person.
+ */
+export function capHolderDebt(members) {
+  const holder = members.find((m) => m.role === 'OWNER');
+  if (!holder || holder.debt <= 0) return members;
+
+  const othersInCredit = money(members.reduce(
+    (sum, m) => (m.id === holder.id ? sum : sum + Math.max(0, m.balance)),
+    0
+  ));
+  holder.debt = money(Math.min(holder.debt, othersInCredit));
+  return members;
 }
 
 export function totalsFrom(members) {
@@ -218,9 +250,9 @@ export function debtsFrom(members) {
     settlements: transfers,
     totalOwed,
     /**
-     * Debt the suggestions above could not pair with anyone — only possible
-     * when more has been spent than was ever put in, so there is nobody left
-     * in credit to be repaid. Surfaced rather than dropped.
+     * Debt the suggestions above could not pair with anyone. Now that the
+     * holder's debt is capped at what others have in the pot it is always
+     * paired, so this stays at zero; kept so older app builds still parse.
      */
     unallocated: money(totalOwed - allocated),
   };

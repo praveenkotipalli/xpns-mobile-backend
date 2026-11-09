@@ -5,6 +5,7 @@ import { ApiError, asyncHandler, created, ok, parse } from '../lib/http.js';
 import { inviteCode, money } from '../lib/ids.js';
 import { settlements } from '../lib/settle.js';
 import { resolveShares } from '../lib/splits.js';
+import { today } from '../lib/dates.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
@@ -84,6 +85,15 @@ const createEventSchema = z.object({
 
 router.post('/', asyncHandler(async (req, res) => {
   const body = parse(createEventSchema, req.body);
+
+  // An event may be tied to a space only by someone in it — otherwise anyone
+  // holding a space id could pin an event onto a stranger's dashboard.
+  if (body.spaceId) {
+    const { rowCount } = await query(
+      'SELECT 1 FROM space_members WHERE space_id = $1 AND user_id = $2', [body.spaceId, req.user.id]
+    );
+    if (!rowCount) throw ApiError.forbidden('You are not a member of that space');
+  }
 
   const event = await withTransaction(async (client) => {
     const { rows: [e] } = await client.query(
@@ -365,9 +375,9 @@ router.post('/:eventId/expenses', loadEvent, asyncHandler(async (req, res) => {
   const expenseId = await withTransaction(async (client) => {
     const { rows: [x] } = await client.query(
       `INSERT INTO event_expenses (event_id, paid_by, item, category_key, amount, spent_on, split_mode, note, created_by)
-       VALUES ($1, $2, $3, $4, $5, COALESCE($6::date, CURRENT_DATE), $7, $8, $9) RETURNING id`,
+       VALUES ($1, $2, $3, $4, $5, $6::date, $7, $8, $9) RETURNING id`,
       [req.event.id, body.paidBy, body.item, body.categoryKey, body.amount,
-       body.spentOn || null, body.splitMode, body.note || null, req.user.id]
+       body.spentOn || today(), body.splitMode, body.note || null, req.user.id]
     );
     for (const s of shares) {
       await client.query(

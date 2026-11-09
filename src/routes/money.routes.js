@@ -3,8 +3,9 @@ import { z } from 'zod';
 import { query } from '../db.js';
 import { ApiError, asyncHandler, created, ok, parse } from '../lib/http.js';
 import { money } from '../lib/ids.js';
+import { currentPeriod, today } from '../lib/dates.js';
 import { memberBalances } from '../lib/balances.js';
-import { requireAuth } from '../middleware/auth.js';
+import { requireAuth, requestedSpaceId, resolveSpace } from '../middleware/auth.js';
 
 /**
  * Personal money — income, savings pots, and what is left in hand.
@@ -30,9 +31,11 @@ const dateString = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'must be YYYY-MM-DD')
 
 const SOURCES = ['SALARY', 'POCKET_MONEY', 'FREELANCE', 'BONUS', 'GIFT', 'INTEREST', 'REFUND', 'OTHER'];
 
+// Defaults are functions: a plain value would be frozen at the month the
+// server booted, and a long-lived instance would keep showing that month.
 const periodSchema = z.object({
-  month: z.coerce.number().int().min(1).max(12).default(new Date().getMonth() + 1),
-  year: z.coerce.number().int().min(2000).max(2100).default(new Date().getFullYear()),
+  month: z.coerce.number().int().min(1).max(12).default(() => currentPeriod().month),
+  year: z.coerce.number().int().min(2000).max(2100).default(() => currentPeriod().year),
   spaceId: z.string().uuid().optional(),
 });
 
@@ -111,23 +114,16 @@ router.get('/summary', asyncHandler(async (req, res) => {
   const { rows: [wallet] } = await query(WALLET_FLOW_SQL, args);
 
   /**
-   * The shared side, for context only. Resolved softly: somebody who has not
-   * joined a space yet still gets a working Money tab rather than a 404.
+   * The shared side, for context only: the space the app is showing, never a
+   * guess. Resolved softly — somebody who has not joined a space yet, or names
+   * one they have left, still gets a working Money tab rather than an error.
    */
-  const { rows: [space] } = await query(
-    `SELECT s.id, s.name, m.id AS member_id
-       FROM spaces s
-       JOIN space_members m ON m.space_id = s.id AND m.user_id = $1
-      WHERE ($2::uuid IS NULL OR s.id = $2::uuid)
-      ORDER BY s.created_at
-      LIMIT 1`,
-    [req.user.id, f.spaceId || null]
-  );
+  const space = await resolveSpace(req.user.id, requestedSpaceId(req), { strict: false });
 
   let shared = null;
   if (space) {
     const members = await memberBalances(space.id);
-    const me = members.find((m) => m.id === space.member_id);
+    const me = members.find((m) => m.id === space.memberId);
     const { rows: [spent] } = await query(
       `SELECT COALESCE(SUM(es.amount), 0) AS total
          FROM expense_shares es
@@ -135,7 +131,7 @@ router.get('/summary', asyncHandler(async (req, res) => {
         WHERE es.member_id = $1
           AND EXTRACT(MONTH FROM e.spent_on) = $2
           AND EXTRACT(YEAR  FROM e.spent_on) = $3`,
-      [space.member_id, f.month, f.year]
+      [space.memberId, f.month, f.year]
     );
     shared = {
       spaceId: space.id,
@@ -173,7 +169,7 @@ router.get('/summary', asyncHandler(async (req, res) => {
           JOIN spaces s ON s.id = w.space_id
          WHERE m.user_id = $1
      ) t
-     ORDER BY on_date DESC, created_at DESC
+     ORDER BY created_at DESC
      LIMIT 12`,
     [req.user.id]
   );
@@ -243,9 +239,9 @@ router.post('/income', asyncHandler(async (req, res) => {
   const body = parse(incomeSchema, req.body);
   const { rows: [row] } = await query(
     `INSERT INTO income_entries (user_id, source, label, amount, received_on, note)
-     VALUES ($1, $2, $3, $4, COALESCE($5::date, CURRENT_DATE), $6)
+     VALUES ($1, $2, $3, $4, $5::date, $6)
      RETURNING *`,
-    [req.user.id, body.source, body.label || null, body.amount, body.receivedOn || null, body.note || null]
+    [req.user.id, body.source, body.label || null, body.amount, body.receivedOn || today(), body.note || null]
   );
   return created(res, mapIncome(row), 'Income added');
 }));
@@ -391,9 +387,9 @@ router.post('/savings', asyncHandler(async (req, res) => {
 
   const { rows: [row] } = await query(
     `INSERT INTO savings_entries (user_id, goal_id, direction, amount, entry_on, note)
-     VALUES ($1, $2, $3, $4, COALESCE($5::date, CURRENT_DATE), $6)
+     VALUES ($1, $2, $3, $4, $5::date, $6)
      RETURNING *`,
-    [req.user.id, body.goalId, body.direction, body.amount, body.entryOn || null, body.note || null]
+    [req.user.id, body.goalId, body.direction, body.amount, body.entryOn || today(), body.note || null]
   );
 
   const saved = money(Number(goal.saved) + (body.direction === 'IN' ? body.amount : -body.amount));
@@ -462,27 +458,24 @@ const toWalletSchema = z.object({
  * writes, against your own member slot — one ledger for the pool, whichever
  * screen the money came from. All this endpoint adds is finding that slot for
  * you, so you never have to pick yourself out of a list of people.
+ *
+ * The space is the one the app names — it sends it as `?spaceId=`. This used
+ * to read only the body, never found it there, and fell back to the caller's
+ * oldest space: anyone looking at a second space moved money into the first,
+ * and it never showed up where they were looking.
  */
 router.post('/to-wallet', asyncHandler(async (req, res) => {
   const body = parse(toWalletSchema, req.body);
 
-  const { rows: [slot] } = await query(
-    `SELECT m.id AS member_id, s.id AS space_id, s.name AS space_name
-       FROM spaces s
-       JOIN space_members m ON m.space_id = s.id AND m.user_id = $1
-      WHERE ($2::uuid IS NULL OR s.id = $2::uuid)
-      ORDER BY s.created_at
-      LIMIT 1`,
-    [req.user.id, body.spaceId || null]
-  );
-  if (!slot) throw ApiError.notFound('You are not a member of that space');
+  const space = await resolveSpace(req.user.id, requestedSpaceId(req));
+  const slot = { member_id: space.memberId, space_id: space.id, space_name: space.name };
 
   const { rows: [row] } = await query(
     `INSERT INTO wallet_transactions (space_id, member_id, type, amount, note, txn_date, created_by)
-     VALUES ($1, $2, 'TOPUP', $3, $4, COALESCE($5::date, CURRENT_DATE), $6)
+     VALUES ($1, $2, 'TOPUP', $3, $4, $5::date, $6)
      RETURNING *`,
     [slot.space_id, slot.member_id, body.amount,
-      body.note || 'From my own money', body.txnDate || null, req.user.id]
+      body.note || 'From my own money', body.txnDate || today(), req.user.id]
   );
 
   const members = await memberBalances(slot.space_id);

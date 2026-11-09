@@ -45,6 +45,15 @@ export function errorHandler(err, _req, res, _next) {
   if (err.code === '23505') {
     return res.status(409).json({ success: false, message: 'That record already exists' });
   }
-  console.error('[xpns] Unhandled error:', err);
+  // A malformed id in the URL (e.g. /api/wallet/abc) is the caller's mistake,
+  // not a server fault — it used to surface as a bare 500.
+  if (err.code === '22P02') {
+    return res.status(400).json({ success: false, message: 'That id is not valid' });
+  }
+  // Foreign key: the row is still referenced, or points at something missing.
+  if (err.code === '23503') {
+    return res.status(409).json({ success: false, message: 'That is still linked to other records' });
+  }
+  console.error('[xpnz] Unhandled error:', err);
   return res.status(500).json({ success: false, message: 'Internal server error' });
 }

@@ -11,9 +11,11 @@ import { equalShares } from './settle.js';
  *   CUSTOM — exact amounts per person, e.g. one drank more than the other
  *
  * `validIds` is the set of people allowed to appear, so a request can never
- * attach a share to somebody outside the space or event.
+ * attach a share to somebody outside the space or event. `defaultIds` is who
+ * an EQUAL split covers when the request names nobody — the active members,
+ * so a bill is never quietly split onto someone who has been archived.
  */
-export function resolveShares({ mode, amount, singleId, ids, shares }, validIds) {
+export function resolveShares({ mode, amount, singleId, ids, shares }, validIds, defaultIds = validIds) {
   const total = money(amount);
 
   if (mode === 'SINGLE') {
@@ -23,7 +25,7 @@ export function resolveShares({ mode, amount, singleId, ids, shares }, validIds)
   }
 
   if (mode === 'EQUAL') {
-    const people = ids?.length ? [...new Set(ids)] : [...validIds];
+    const people = ids?.length ? [...new Set(ids)] : [...defaultIds];
     if (!people.length) throw ApiError.badRequest('Choose who to split between');
     for (const id of people) {
       if (!validIds.has(id)) throw ApiError.badRequest('A selected person is not in this space');

@@ -1,4 +1,4 @@
--- xpns-mobile schema
+-- xpnz-mobile schema
 -- Ported and extended from the Spring Boot "expensys" capstone project.
 -- The old app had a single `expenses` table (date, item, category, spent, spent_by).
 -- Here `spent_by` becomes a real member row so we can track per-person balances.

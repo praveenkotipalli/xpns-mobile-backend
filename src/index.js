@@ -12,6 +12,7 @@ import categoryRoutes from './routes/category.routes.js';
 import reportRoutes from './routes/report.routes.js';
 import eventRoutes from './routes/event.routes.js';
 import moneyRoutes from './routes/money.routes.js';
+import pageRoutes from './routes/pages.routes.js';
 
 const app = express();
 
@@ -45,12 +46,14 @@ app.use('/api/categories', categoryRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/events', eventRoutes);
 app.use('/api/money', moneyRoutes);
+// /privacy and /delete-account: plain web pages that Google Play links to.
+app.use(pageRoutes);
 
 app.use((_req, res) => res.status(404).json({ success: false, message: 'Route not found' }));
 app.use(errorHandler);
 
 app.listen(env.port, '0.0.0.0', () => {
-  console.log(`\n  xpns server listening on http://0.0.0.0:${env.port}`);
+  console.log(`\n  xpnz server listening on http://0.0.0.0:${env.port}`);
   console.log(`  Health check: http://localhost:${env.port}/health\n`);
 });
 

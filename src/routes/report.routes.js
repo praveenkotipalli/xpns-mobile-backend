@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { query } from '../db.js';
 import { asyncHandler, ok, parse } from '../lib/http.js';
+import { currentPeriod } from '../lib/dates.js';
 import { requireAuth, requireSpace } from '../middleware/auth.js';
 
 const router = Router();
@@ -16,7 +17,7 @@ const MONTH_NAMES = ['JANUARY', 'FEBRUARY', 'MARCH', 'APRIL', 'MAY', 'JUNE',
  */
 router.get('/monthly', asyncHandler(async (req, res) => {
   const f = parse(z.object({
-    year: z.coerce.number().int().min(2000).max(2100).default(new Date().getFullYear()),
+    year: z.coerce.number().int().min(2000).max(2100).default(() => currentPeriod().year),
     memberId: z.string().uuid().optional(),
     groupBy: z.enum(['SUB', 'MAIN']).default('SUB'),
   }), req.query);
@@ -105,10 +106,10 @@ router.get('/monthly', asyncHandler(async (req, res) => {
 
 /** Single-period snapshot used by the Reports tab header. */
 router.get('/summary', asyncHandler(async (req, res) => {
-  const now = new Date();
+  const now = currentPeriod();
   const f = parse(z.object({
-    month: z.coerce.number().int().min(1).max(12).default(now.getMonth() + 1),
-    year: z.coerce.number().int().min(2000).max(2100).default(now.getFullYear()),
+    month: z.coerce.number().int().min(1).max(12).default(now.month),
+    year: z.coerce.number().int().min(2000).max(2100).default(now.year),
     memberId: z.string().uuid().optional(),
   }), req.query);
 

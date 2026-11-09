@@ -4,6 +4,7 @@ import { query, withTransaction } from '../db.js';
 import { ApiError, asyncHandler, created, ok, parse } from '../lib/http.js';
 import { debtsFrom, memberBalances } from '../lib/balances.js';
 import { resolveShares } from '../lib/splits.js';
+import { today } from '../lib/dates.js';
 import { requireAuth, requireSpace } from '../middleware/auth.js';
 
 const router = Router();
@@ -48,9 +49,30 @@ async function assertCategory(spaceId, key) {
 
 async function spaceMembers(spaceId) {
   const { rows } = await query(
-    'SELECT id, name, role FROM space_members WHERE space_id = $1', [spaceId]
+    'SELECT id, name, role, is_active FROM space_members WHERE space_id = $1', [spaceId]
   );
   return rows;
+}
+
+/** Everyone in the space may appear on a bill; an unnamed equal split covers the active ones. */
+function memberSets(members) {
+  return {
+    validIds: new Set(members.map((m) => m.id)),
+    activeIds: new Set(members.filter((m) => m.is_active).map((m) => m.id)),
+  };
+}
+
+/**
+ * Which split an edit describes. The app's edit form sends `memberId` alone to
+ * move a bill onto one person; that used to be read with the bill's *old*
+ * mode, so editing an equal split this way spread it over the whole space.
+ */
+function editMode(body, existingMode) {
+  if (body.splitMode) return body.splitMode;
+  if (body.shares) return 'CUSTOM';
+  if (body.memberIds) return 'EQUAL';
+  if (body.memberId) return 'SINGLE';
+  return existingMode;
 }
 
 /**
@@ -62,7 +84,7 @@ router.post('/', asyncHandler(async (req, res) => {
   await assertCategory(req.space.id, body.categoryKey);
 
   const members = await spaceMembers(req.space.id);
-  const validIds = new Set(members.map((m) => m.id));
+  const { validIds, activeIds } = memberSets(members);
 
   const paidBy = body.paidBy || req.space.memberId;
   if (!validIds.has(paidBy)) throw ApiError.badRequest('The payer is not in this space');
@@ -74,18 +96,18 @@ router.post('/', asyncHandler(async (req, res) => {
     singleId: body.memberId,
     ids: body.memberIds,
     shares: body.shares?.map((s) => ({ id: s.memberId, amount: s.amount })),
-  }, validIds);
+  }, validIds, activeIds);
 
   const expenseId = await withTransaction(async (client) => {
     const { rows: [expense] } = await client.query(
       `INSERT INTO expenses
          (space_id, member_id, item, category_key, amount, spent_on, note, created_by,
           paid_by, from_pot, split_mode)
-       VALUES ($1, $2, $3, $4, $5, COALESCE($6::date, CURRENT_DATE), $7, $8, $9, TRUE, $10)
+       VALUES ($1, $2, $3, $4, $5, $6::date, $7, $8, $9, TRUE, $10)
        RETURNING id`,
       [req.space.id,
        shares.length === 1 ? shares[0].id : null, // legacy single-consumer column
-       body.item, body.categoryKey, body.amount, body.spentOn || null, body.note || null,
+       body.item, body.categoryKey, body.amount, body.spentOn || today(), body.note || null,
        req.user.id, paidBy, body.splitMode]
     );
     for (const share of shares) {
@@ -252,7 +274,7 @@ router.patch('/:expenseId', asyncHandler(async (req, res) => {
   if (!existing) throw ApiError.notFound('Expense not found');
 
   const members = await spaceMembers(req.space.id);
-  const validIds = new Set(members.map((m) => m.id));
+  const { validIds, activeIds } = memberSets(members);
 
   const paidBy = body.paidBy || existing.paid_by;
   if (paidBy && !validIds.has(paidBy)) throw ApiError.badRequest('The payer is not in this space');
@@ -260,14 +282,15 @@ router.patch('/:expenseId', asyncHandler(async (req, res) => {
   const amount = body.amount ?? Number(existing.amount);
   // Only recompute the split when the request actually describes one.
   const respreads = body.splitMode || body.memberId || body.memberIds || body.shares;
+  const mode = editMode(body, existing.split_mode);
   const shares = respreads
     ? resolveShares({
-        mode: body.splitMode || existing.split_mode,
+        mode,
         amount,
         singleId: body.memberId,
         ids: body.memberIds,
         shares: body.shares?.map((s) => ({ id: s.memberId, amount: s.amount })),
-      }, validIds)
+      }, validIds, activeIds)
     : null;
 
   await withTransaction(async (client) => {
@@ -282,7 +305,7 @@ router.patch('/:expenseId', asyncHandler(async (req, res) => {
               split_mode   = COALESCE($7, split_mode)
         WHERE id = $8`,
       [body.item ?? null, body.amount ?? null, body.categoryKey ?? null, body.spentOn ?? null,
-       body.note ?? null, paidBy, body.splitMode ?? null, existing.id]
+       body.note ?? null, paidBy, respreads ? mode : null, existing.id]
     );
 
     if (shares) {

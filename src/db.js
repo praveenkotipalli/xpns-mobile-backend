@@ -19,7 +19,7 @@ export const pool = new pg.Pool({
 });
 
 pool.on('error', (err) => {
-  console.error('[xpns] Unexpected idle client error', err);
+  console.error('[xpnz] Unexpected idle client error', err);
 });
 
 export function query(text, params) {

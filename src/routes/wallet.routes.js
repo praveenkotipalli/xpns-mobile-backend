@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { query } from '../db.js';
 import { ApiError, asyncHandler, created, ok, parse } from '../lib/http.js';
 import { memberBalances } from '../lib/balances.js';
+import { today } from '../lib/dates.js';
 import { requireAuth, requireSpace } from '../middleware/auth.js';
 
 const router = Router();
@@ -30,9 +31,9 @@ router.post('/', asyncHandler(async (req, res) => {
 
   const { rows: [txn] } = await query(
     `INSERT INTO wallet_transactions (space_id, member_id, type, amount, note, txn_date, created_by)
-     VALUES ($1, $2, $3, $4, $5, COALESCE($6::date, CURRENT_DATE), $7)
+     VALUES ($1, $2, $3, $4, $5, $6::date, $7)
      RETURNING *`,
-    [req.space.id, body.memberId, body.type, body.amount, body.note || null, body.txnDate || null, req.user.id]
+    [req.space.id, body.memberId, body.type, body.amount, body.note || null, body.txnDate || today(), req.user.id]
   );
 
   const members = await memberBalances(req.space.id);

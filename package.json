@@ -1,9 +1,9 @@
 {
-  "name": "xpns-server",
+  "name": "xpnz-server",
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Node/Express + Neon backend for the xpns mobile expense tracker",
+  "description": "Node/Express + Neon backend for the xpnz mobile expense tracker",
   "main": "src/index.js",
   "scripts": {
     "dev": "node --watch src/index.js",
